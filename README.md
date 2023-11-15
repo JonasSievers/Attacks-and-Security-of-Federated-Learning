@@ -11,3 +11,9 @@ This repsoitory consists of the following parts:
 - **models** folder: Here the model weights are stored
 - **src** folder: Here the main scripts are stored for the forecasting baseline, local learning, federated learning and evaluation
   - **utils** folder: Here helper classes for data handling, model generation, and model handling are stored
+
+### Install and Run the project 
+To run the project you can fork this repository and install all dependencies by running
+```
+pip install -r requirements.txt
+```
