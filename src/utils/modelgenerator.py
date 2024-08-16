@@ -39,7 +39,7 @@ class ModelGenerator():
     routing_logits = layers.Dense(num_experts, activation='softmax')(x)
     #experts
     experts = [m1.build_expert_network(expert_units=expert_units)(x) for _ in range(num_experts)]
-    expert_outputs = tf.stack(experts, axis=1)
+    expert_outputs = layers.Lambda(lambda tensors: tf.stack(tensors, axis=1))(experts)
     #Add and Multiply expert models with router probability
     moe_output = layers.Lambda(lambda x: tf.einsum('bsn,bnse->bse', x[0], x[1]))([routing_logits, expert_outputs])
     #moe_output = tf.einsum('bsn,bnse->bse', routing_logits, expert_outputs)
@@ -67,7 +67,7 @@ class ModelGenerator():
     routing_logits = layers.Dense(num_experts, activation='softmax')(x)
     #experts
     experts = [m1.build_expert_network(expert_units=expert_units)(x) for _ in range(num_experts)]
-    expert_outputs = tf.stack(experts, axis=1)
+    expert_outputs = layers.Lambda(lambda tensors: tf.stack(tensors, axis=1))(experts)
     #Add and Multiply expert models with router probability
     moe_output = layers.Lambda(lambda x: tf.einsum('bsn,bnse->bse', x[0], x[1]))([routing_logits, expert_outputs])
     #moe_output = tf.einsum('bsn,bnse->bse', routing_logits, expert_outputs)
