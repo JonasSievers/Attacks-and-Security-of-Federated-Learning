@@ -15,9 +15,27 @@ from sklearn.metrics import mean_absolute_error
 import pandas as pd
 import time
 
-#The ModelGenerator class contains methods to build different models
-#Tensorflow models: softgated_moe_model, top1_moe_model, topk_moe_model, lstm_model, bilstm_model, cnn, dense, probability_model, transformer
-#SKlearn models: Svm, Elasticnet_regression, Decisiontree, Randomforrest, K_neighbors regression
+class StackExpertsLayer(layers.Layer):
+  def call(self, experts):
+      # Stack tensors along a new axis (axis=1)
+      return tf.stack(experts, axis=1)
+
+  def compute_output_shape(self, input_shape):
+      # Calculate output shape based on the stacked expert tensors
+      expert_shape = input_shape[0]  # All experts should have the same shape
+      return (expert_shape[0], len(input_shape), expert_shape[1], expert_shape[2])
+  
+# Custom layer to compute MoE output
+class MoEOutputLayer(layers.Layer):
+  def call(self, inputs):
+      routing_logits, expert_outputs = inputs
+      # Compute the mixture of experts output using einsum
+      return tf.einsum('bsn,bnse->bse', routing_logits, expert_outputs)
+
+  def compute_output_shape(self, input_shape):
+      routing_shape, expert_shape = input_shape
+      return (routing_shape[0], expert_shape[-2], expert_shape[-1])
+
 class ModelGenerator():
   
   #Builds the expert models for the MoE Layer
@@ -37,12 +55,11 @@ class ModelGenerator():
     #EMBEDDED MOE LAYER
     # Gating network (Routing Softmax)
     routing_logits = layers.Dense(num_experts, activation='softmax')(x)
-    #experts
     experts = [m1.build_expert_network(expert_units=expert_units)(x) for _ in range(num_experts)]
-    expert_outputs = layers.Lambda(lambda tensors: tf.stack(tensors, axis=1))(experts)
-    #Add and Multiply expert models with router probability
-    moe_output = layers.Lambda(lambda x: tf.einsum('bsn,bnse->bse', x[0], x[1]))([routing_logits, expert_outputs])
-    #moe_output = tf.einsum('bsn,bnse->bse', routing_logits, expert_outputs)
+    expert_outputs = StackExpertsLayer()(experts)
+    moe_output = MoEOutputLayer()([routing_logits, expert_outputs])
+    #expert_outputs = layers.Lambda(lambda tensors: tf.stack(tensors, axis=1))(experts)
+    #moe_output = layers.Lambda(lambda x: tf.einsum('bsn,bnse->bse', x[0], x[1]))([routing_logits, expert_outputs])
     #END MOE LAYER
 
     x = layers.Dense(dense_units, activation="relu")(moe_output)
@@ -65,12 +82,9 @@ class ModelGenerator():
     #EMBEDDED MOE LAYER
     # Gating network (Routing Softmax)
     routing_logits = layers.Dense(num_experts, activation='softmax')(x)
-    #experts
     experts = [m1.build_expert_network(expert_units=expert_units)(x) for _ in range(num_experts)]
-    expert_outputs = layers.Lambda(lambda tensors: tf.stack(tensors, axis=1))(experts)
-    #Add and Multiply expert models with router probability
-    moe_output = layers.Lambda(lambda x: tf.einsum('bsn,bnse->bse', x[0], x[1]))([routing_logits, expert_outputs])
-    #moe_output = tf.einsum('bsn,bnse->bse', routing_logits, expert_outputs)
+    expert_outputs = StackExpertsLayer()(experts)
+    moe_output = MoEOutputLayer()([routing_logits, expert_outputs])
     #END MOE LAYER
 
     x = layers.Bidirectional(layers.LSTM(lstm_units, return_sequences=True))(moe_output)

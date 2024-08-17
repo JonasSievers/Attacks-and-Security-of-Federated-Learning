@@ -7,6 +7,7 @@ import time
 from tensorflow import keras
 import matplotlib.pyplot as plt
 import pickle
+from .modelgenerator import *
 
 class TimingCallback(tf.keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
@@ -227,17 +228,30 @@ def initialize_global_models(X_train, user_id, m1):
     return global_models
 
 def save_global_models(global_models, attack, round, cwd, fed_round=0):
-    global_models["cnn_model"].save(cwd + f"/models/{attack}/CNN/FederatedRound_{fed_round}/round_{round}")
-    global_models["bilstm_model"].save(cwd + f"/models/{attack}/BiLSTM/FederatedRound_{fed_round}/round_{round}")
-    global_models["softdense_model"].save(cwd + f"/models/{attack}/SoftDense/FederatedRound_{fed_round}/round_{round}")
-    global_models["softlstm_model"].save(cwd + f"/models/{attack}/SoftLSTM/FederatedRound_{fed_round}/round_{round}")
+
+    cnn_path = os.path.join(cwd, f"models/{attack}/CNN/FederatedRound_{fed_round}/round_{round}")
+    bilstm_path = os.path.join(cwd, f"models/{attack}/BiLSTM/FederatedRound_{fed_round}/round_{round}")
+    softdense_path = os.path.join(cwd, f"models/{attack}/SoftDense/FederatedRound_{fed_round}/round_{round}")
+    softlstm_path = os.path.join(cwd, f"models/{attack}/SoftLSTM/FederatedRound_{fed_round}/round_{round}")
+    
+    # Create directories if they do not exist
+    os.makedirs(cnn_path, exist_ok=True)
+    os.makedirs(bilstm_path, exist_ok=True)
+    os.makedirs(softdense_path, exist_ok=True)
+    os.makedirs(softlstm_path, exist_ok=True)
+
+    global_models["cnn_model"].save(cwd + f"/models/{attack}/CNN/FederatedRound_{fed_round}/round_{round}/model.keras")
+    global_models["bilstm_model"].save(cwd + f"/models/{attack}/BiLSTM/FederatedRound_{fed_round}/round_{round}/model.keras")
+    global_models["softdense_model"].save(cwd + f"/models/{attack}/SoftDense/FederatedRound_{fed_round}/round_{round}/model.keras")
+    global_models["softlstm_model"].save(cwd + f"/models/{attack}/SoftLSTM/FederatedRound_{fed_round}/round_{round}/model.keras")
 
 def load_global_models(attack, fed_round, round, cwd):
+    custom_objects = {'StackExpertsLayer': StackExpertsLayer, 'MoEOutputLayer': MoEOutputLayer}
     global_models = {
-        "cnn_model": keras.models.load_model(cwd + f"/models/{attack}/CNN/FederatedRound_{fed_round}/round_{round}", compile=False),
-        "bilstm_model": keras.models.load_model(cwd + f"/models/{attack}/BiLSTM/FederatedRound_{fed_round}/round_{round}", compile=False),
-        "softdense_model": keras.models.load_model(cwd + f"/models/{attack}/SoftDense/FederatedRound_{fed_round}/round_{round}", compile=False),
-        "softlstm_model": keras.models.load_model(cwd + f"/models/{attack}/SoftLSTM/FederatedRound_{fed_round}/round_{round}", compile=False),
+        "cnn_model": keras.models.load_model(cwd + f"/models/{attack}/CNN/FederatedRound_{fed_round}/round_{round}/model.keras", custom_objects=custom_objects, compile=False),
+        "bilstm_model": keras.models.load_model(cwd + f"/models/{attack}/BiLSTM/FederatedRound_{fed_round}/round_{round}/model.keras", custom_objects=custom_objects, compile=False),
+        "softdense_model": keras.models.load_model(cwd + f"/models/{attack}/SoftDense/FederatedRound_{fed_round}/round_{round}/model.keras", custom_objects=custom_objects, compile=False),
+        "softlstm_model": keras.models.load_model(cwd + f"/models/{attack}/SoftLSTM/FederatedRound_{fed_round}/round_{round}/model.keras", custom_objects=custom_objects, compile=False),
     }
     return global_models
 
@@ -325,7 +339,7 @@ def run_federated_training(df_array, X_train, y_train, X_val, y_val, X_test, y_t
             average_weights_dic = get_average_weights(local_weights_dic)
             global_models = set_average_weights_to_global_models(global_models, average_weights_dic)
 
-            save_global_models(global_models, attack, round, cwd, fed_round)
+            save_global_models(global_models, attack, round, cwd, fed_round+1)
             print("FL: Saved Global models - round ", round, " (fed_round ", fed_round, ")")
 
 def run_federated_local_evaluation(df_array, X_train, y_train, X_val, y_val, X_test, y_test, callbacks, m1, mh, attack, cwd, loss, metrics, rounds=3, fed_round=3, max_epochs=1):
