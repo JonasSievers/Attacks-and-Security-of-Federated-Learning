@@ -5,6 +5,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 import time
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
 
 from keras.callbacks import ModelCheckpoint
 
@@ -56,10 +57,83 @@ class Modelhandler():
             "avg_time_epoch": [avg_time_epoch],
             "mse": [test_loss[0]],
             "rmse": [test_loss[1]],
-            "mae": [test_loss[2]]
+            "mae": [test_loss[2]],
         })
 
         return model_user_result
+    
+    def get_hour_from_scaled_sin_cos(sin_hour_scaled, cos_hour_scaled):
+        # Reverse the min-max scaling (assuming scaling was done to [0, 1])
+        sin_hour = (sin_hour_scaled * 2) - 1  # Rescale to [-1, 1]
+        cos_hour = (cos_hour_scaled * 2) - 1  # Rescale to [-1, 1]
+        
+        # Convert sin/cos values back to hour (0-23)
+        radians = np.arctan2(sin_hour, cos_hour)
+        hours = np.round((radians / (2 * np.pi)) * 24).astype(int) % 24  # Ensure values are within 0-23
+        return hours
+
+    def compile_fit_evaluate_model_per_timestep(self, model, X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user, architecture, loss=tf.keras.losses.MeanSquaredError(), 
+            metrics=[tf.keras.metrics.RootMeanSquaredError(), tf.keras.metrics.MeanAbsoluteError()], max_epochs=1, batch_size=16):
+        
+        model.compile(loss=loss, optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), metrics=metrics)
+        history = model.fit(X_train, y_train, epochs=max_epochs, batch_size=batch_size, validation_data=(X_val, y_val), callbacks=callbacks, verbose=0)
+
+        # Make predictions
+        predictions = model.predict(X_test, batch_size=batch_size, verbose=0)
+        
+        timestep_data = []
+        
+        # Define the starting hour and minute (10:30)
+        start_hour = 10
+        start_minute = 30
+        
+        # Calculate metrics for each of the 48 timesteps
+        for timestep in range(48):
+            # Calculate the current hour and minute
+            total_minutes = start_hour * 60 + start_minute + timestep * 30
+            current_hour = (total_minutes // 60) % 24  # Wrap around if the total hours exceed 24
+            current_minute = total_minutes % 60
+            
+            # Select the actual and predicted values corresponding to this timestep
+            y_test_timestep = y_test[timestep::48]  # Actual values for this timestep
+            predictions_timestep = predictions[timestep::48]  # Predicted values for this timestep
+            
+            # Calculate RMSE for this timestep
+            rmse = tf.keras.metrics.RootMeanSquaredError()
+            rmse.update_state(y_test_timestep, predictions_timestep)
+            
+            # Calculate MSE for this timestep
+            mse = tf.keras.metrics.MeanSquaredError()
+            mse.update_state(y_test_timestep, predictions_timestep)
+            
+            # Calculate MAE for this timestep
+            mae = tf.keras.metrics.MeanAbsoluteError()
+            mae.update_state(y_test_timestep, predictions_timestep)
+            
+            # Append the results to the list
+            timestep_data.append({
+                "user": user,
+                "architecture" : architecture,
+                "hour": current_hour,
+                "minute": current_minute,
+                "rmse": rmse.result().numpy(),
+                "mse": mse.result().numpy(),
+                "mae": mae.result().numpy()
+            })
+        
+        # Convert to a DataFrame
+        df = pd.DataFrame(timestep_data)
+        
+        # Store results in a DataFrame
+        train_times = callbacks[1].get_training_times_df()
+        total_train_time = train_times["Total Training Time"][0]
+        avg_time_epoch = train_times["Epoch Avg Train_time"].iloc[-1]
+        
+        df["train_time"] = total_train_time
+        df["avg_time_epoch"] = avg_time_epoch
+
+        return df
+   
     
     def aggregate_user_results(self, df_array, all_results, architecture):
         results = pd.DataFrame(columns=['architecture', 'train_time', 'avg_time_epoch', 'mse', 'mse_std', 'rmse', 'rmse_std', 'mae', 'mae_std'])

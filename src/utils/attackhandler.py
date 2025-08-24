@@ -1,6 +1,7 @@
 #Imports
 import os
 import pandas as pd
+import numpy as np
 import tensorflow as tf
 from keras import backend as K
 import time
@@ -159,6 +160,14 @@ def evaluate_models(models, X_train, y_train, X_val, y_val, X_test, y_test, call
     results["bilstm_user_results"] = mh.compile_fit_evaluate_model(models['bilstm_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "BiLSTM", max_epochs=max_epochs)
     results["softdense_user_results"] = mh.compile_fit_evaluate_model(models['softdense_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "Soft_dense", max_epochs=max_epochs)
     results["softlstm_user_results"] = mh.compile_fit_evaluate_model(models['softlstm_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "Soft_lstm", max_epochs=max_epochs)
+    return results
+
+def evaluate_models_per_timestep(models, X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, mh, max_epochs):
+    results = {}
+    results["cnn_user_results"] = mh.compile_fit_evaluate_model_per_timestep(models['cnn_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "CNN", max_epochs=max_epochs)
+    results["bilstm_user_results"] = mh.compile_fit_evaluate_model_per_timestep(models['bilstm_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "BiLSTM", max_epochs=max_epochs)
+    results["softdense_user_results"] = mh.compile_fit_evaluate_model_per_timestep(models['softdense_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "Soft_dense", max_epochs=max_epochs)
+    results["softlstm_user_results"] = mh.compile_fit_evaluate_model_per_timestep(models['softlstm_model'], X_train, y_train, X_val, y_val, X_test, y_test, callbacks, user_id, "Soft_lstm", max_epochs=max_epochs)
     return results
 
 def merge_results(all_results, user_results):
@@ -360,7 +369,7 @@ def run_federated_local_evaluation(df_array, X_train, y_train, X_val, y_val, X_t
             local_models = initialize_local_models(X_train, user_id, global_models, m1, loss, metrics)
             
             # Evaluate models
-            user_results = evaluate_models(local_models, X_train[user_id], y_train[user_id], X_val[user_id], y_val[user_id], X_test[user_id], y_test[user_id], callbacks, user_id, mh, max_epochs=max_epochs)
+            user_results = evaluate_models_per_timestep(local_models, X_train[user_id], y_train[user_id], X_val[user_id], y_val[user_id], X_test[user_id], y_test[user_id], callbacks, user_id, mh, max_epochs=max_epochs)
             
             # Merge the results into all_results
             all_results = merge_results(all_results, user_results)
@@ -371,19 +380,34 @@ def run_federated_local_evaluation(df_array, X_train, y_train, X_val, y_val, X_t
     return aggregated_results, all_results
 
 #Attacks ----------------------------------------------
-def plot_impact_of_attack_noise(X_train_raw, X_train, user="user1"):
+def plot_impact_of_attack_noise(X_train_raw, X_train, user="user1", features=False):
     
-    plt.figure(figsize=(10,1))
-    plt.plot(X_train_raw[user][0], label='Original Data', linestyle='--', color='blue')
-    plt.plot(X_train[user][0], label='Poisend Data', linestyle='-', color='red')
+    if features:
+        plt.figure(figsize=(10, 1))
+        plt.plot(X_train_raw["user1"][0][:,0], label='Original Data', linestyle='--', color='blue')
+        plt.plot(X_train["user1"][0][:,0], label='Poisoned Data', linestyle='-', color='red')
 
-    # Adding title, labels, legend, and grid
-    plt.title(f'Original vs. Poisened Data for {user}')
-    plt.xlabel('Time steps')
-    plt.ylabel('kW')
-    plt.legend()
+        # Adding title, labels, legend, and grid
+        plt.title(f'Original vs. Poisoned Data for {user} (First Feature)')
+        plt.xlabel('Time steps')
+        plt.ylabel('kW')
+        plt.legend()
+        plt.grid(True)
 
-    plt.show()
+        plt.show()
+    else:
+        plt.figure(figsize=(10,1))
+        plt.plot(X_train_raw[user][0], label='Original Data', linestyle='--', color='blue')
+        plt.plot(X_train[user][0], label='Poisend Data', linestyle='-', color='red')
+
+        # Adding title, labels, legend, and grid
+        plt.title(f'Original vs. Poisened Data for {user}')
+        plt.xlabel('Time steps')
+        plt.ylabel('kW')
+        plt.legend()
+
+        plt.show()
+
 
 def save_dictionaries(data_to_save, folder_name="results/"):
     
@@ -394,3 +418,46 @@ def save_dictionaries(data_to_save, folder_name="results/"):
             pickle.dump(data, f)
     
     print("Dictionaries saved successfully!")
+
+################################################################################## Backdoors
+
+# Function to create sine and cosine transformations for hours and minutes
+def create_sin_cos_features(df):
+    hours = df.index.hour
+    minutes = df.index.minute
+    
+    hours_in_radians = 2 * np.pi * hours / 24  # Convert hours to radians (0 to 23 mapped to 0 to 2π)
+    minutes_in_radians = 2 * np.pi * minutes / 60  # Convert minutes to radians (0 to 59 mapped to 0 to 2π)
+    
+    # Create new columns for sine and cosine transformations
+    df['hour_sin'] = np.sin(hours_in_radians).round(4)
+    df['hour_cos'] = np.cos(hours_in_radians).round(4)
+    df['minute_sin'] = np.sin(minutes_in_radians).round(4)
+    df['minute_cos'] = np.cos(minutes_in_radians).round(4)
+    
+    return df
+
+def backdoor_attack_at_time(X_train, noise_scale, hours=[0, 1], user="user1"):
+    masks = []
+
+    # Loop through each hour in the hours array
+    for hour in hours:
+        # Calculate sine and cosine values for the hour
+        hour_sin = np.sin(hour * 2 * np.pi / 24).round(4)  # sin(hour/24 * 2π)
+        hour_cos = np.cos(hour * 2 * np.pi / 24).round(4)  # cos(hour/24 * 2π)
+
+        # Scale values to range [0, 1]
+        hour_sin_scaled = (hour_sin + 1) / 2
+        hour_cos_scaled = (hour_cos + 1) / 2
+
+        # Create a mask for the current hour
+        mask_hour = (X_train[user][:, :, 1] == hour_sin_scaled) & (X_train[user][:, :, 2] == hour_cos_scaled)
+        masks.append(mask_hour)
+
+    # Combine all the masks to target all specified hours
+    combined_mask = np.any(masks, axis=0)
+
+    # Apply noise only to the load values (first feature) for the selected times
+    X_train[user][:, :, 0][combined_mask] += np.random.normal(loc=0.0, scale=noise_scale, size=combined_mask.sum())
+    
+    return X_train
