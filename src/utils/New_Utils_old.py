@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks, backend as K # type: ignore
-import matplotlib.pyplot as plt
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
@@ -233,58 +232,20 @@ def build_soft_bilstm_moe_model(input_shape, num_experts=4, expert_units=8, lstm
     out = layers.Dense(horizon)(x)
     return models.Model(inp, out, name="SoftLSTMMoE")
 
-def build_mlp_model(input_shape, horizon=1, dense_units=32, num_layers=2, dropout=0.2, batch_size=16, name="MLP"):
-    """
-    Plain MLP: Flatten (T*F) -> [Dense(32, relu) x2] -> Dropout -> Dense(horizon)
-    Matches the existing input/output interfaces used elsewhere.
-    """
-    inp = layers.Input(shape=(input_shape[1], input_shape[2]), batch_size=batch_size)
-    x = layers.Flatten()(inp)
-    for _ in range(num_layers):
-        x = layers.Dense(dense_units, activation="relu")(x)
-    x = layers.Dropout(dropout)(x)
-    out = layers.Dense(horizon)(x)
-    return models.Model(inp, out, name=name)
-
 # --- Surrogate forecaster used to guide the generator
 def build_surrogate(input_shape, cfg):
-    """
-    Fast MLP surrogate:
-      Flatten(T*F) -> LayerNorm -> [Dense(units) + Dropout]^L -> Dense(1)
-
-    cfg keys reused from your current GAN surrogate block:
-      - units:      width of hidden layers (default 64)
-      - num_layers: number of hidden layers (default 2)
-      - dropout:    dropout rate (default 0.0)
-      - (horizon is assumed 1 for the surrogate)
-    """
-    T, F = input_shape[1], input_shape[2]
-    units      = int(cfg.get("units", 32))
-    num_layers = int(cfg.get("num_layers", 2))
-    dropout    = float(cfg.get("dropout", 0.0))
-
-    inp = layers.Input(shape=(T, F), name="surrogate_input")
-    x = layers.Flatten(name="flat")(inp)                  # position-aware: last steps matter
-    x = layers.LayerNormalization(name="ln")(x)           # stabilizes scale across buildings
-    for i in range(num_layers):
-        x = layers.Dense(units, activation="relu", name=f"fc{i+1}")(x)
-        if dropout > 0.0:
-            x = layers.Dropout(dropout, name=f"drop{i+1}")(x)
-    out = layers.Dense(1, name="y_hat")(x)
-
-    return models.Model(inp, out, name="SurrogateMLP")
+    return build_bilstm_model(
+        input_shape,horizon=1,units=cfg.get("units",8),num_layers=cfg.get("num_layers",1),
+        dropout=cfg.get("dropout",0.0),batch_size=None,name="Surrogate")
 
 # --- Perturbation generator (Conv1D -> tanh)
 def build_perturbation_generator(input_shape):
-    T, F = input_shape[1], input_shape[2]
-    hidden = 32  # small, fast, works well for localized masked triggers
-
-    inp = layers.Input(shape=(T, F), name="gen_input")
-    x = layers.Dense(hidden, activation="relu", name="g_fc1")(inp)
-    x = layers.Dense(hidden, activation="relu", name="g_fc2")(x)
-    out = layers.Dense(F, activation="tanh", name="g_out")(x)
-
-    return models.Model(inp, out, name="PerturbGenMLP")
+    inp = layers.Input(shape=(input_shape[1], input_shape[2]))
+    x = layers.Conv1D(32, 3, padding='same', activation='relu')(inp)
+    x = layers.Conv1D(32, 3, padding='same', activation='relu')(x)
+    # output per feature; we'll keep only channel 0 (main) and zero the rest
+    out = layers.Conv1D(input_shape[2], 1, padding='same', activation='tanh')(x)
+    return models.Model(inp, out, name="PerturbGen")
 
 # ============================================================
 # Training / Evaluation helpers
@@ -301,37 +262,6 @@ class TimingCallback(callbacks.Callback):
         return time.time() - self.start_time
     def avg_epoch_time(self):
         return float(np.mean(self.epoch_times)) if self.epoch_times else 0.0
-
-def fit_local_only(model, X_train, y_train, X_val, y_val, train_cfg):
-    model.compile(
-        loss=tf.keras.losses.MeanSquaredError(),
-        optimizer=tf.keras.optimizers.Adam(learning_rate=train_cfg.get("learning_rate", 1e-3)),
-        metrics=[tf.keras.metrics.RootMeanSquaredError(), tf.keras.metrics.MeanAbsoluteError()]
-    )
-    es = callbacks.EarlyStopping(monitor='val_loss',
-                                 patience=train_cfg.get("patience", 10),
-                                 mode='min',
-                                 restore_best_weights=True)
-    hist = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=train_cfg.get("max_epochs", 100),
-        batch_size=train_cfg.get("batch_size", 16),
-        callbacks=[es],
-        verbose=0
-    )
-    return hist.history 
-
-# === ADDED: evaluation-only (compile + evaluate, no training)
-def evaluate_only(model, X_test, y_test, batch_size, lr=1e-3):
-    model.compile(
-        loss=tf.keras.losses.MeanSquaredError(),
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        metrics=[tf.keras.metrics.RootMeanSquaredError(), tf.keras.metrics.MeanAbsoluteError()]
-    )
-    loss, rmse, mae = model.evaluate(X_test, y_test, batch_size=batch_size, verbose=0)
-    return {"mse": float(loss), "rmse": float(rmse), "mae": float(mae),
-            "train_time": 0.0, "avg_time_epoch": 0.0}
 
 def compile_fit_eval(model, X_train, y_train, X_val, y_val, X_test, y_test,
                      max_epochs=100, batch_size=16, patience=10, lr=1e-3):
@@ -369,30 +299,8 @@ def sum_weights(weight_list):
         avg.append(np.mean(np.array(layer_weights, dtype=object), axis=0))
     return avg
 
-def weighted_average_weights(weight_list, coeffs):
-    """
-    weight_list: list of client weight lists (same structure as model.get_weights()).
-    coeffs: list of non-negative floats normalized to sum to 1 (one per client).
-    Returns a single averaged weight list with the same structure.
-    """
-    avg = []
-    for layer_weights in zip(*weight_list):
-        # layer_weights is a tuple of np.arrays (one per client) with identical shapes
-        layer_avg = np.zeros_like(layer_weights[0])
-        for c, w in zip(coeffs, layer_weights):
-            layer_avg = layer_avg + c * w
-        avg.append(layer_avg)
-    return avg
-
 def init_global_models(input_shape, models_to_run: list, model_cfg: dict, batch_size: int):
     builders = {
-        "mlp":      lambda: build_mlp_model(
-                            input_shape,
-                            horizon=model_cfg["mlp"]["horizon"],
-                            dense_units=model_cfg["mlp"]["dense_units"],
-                            num_layers=model_cfg["mlp"]["num_layers"],
-                            dropout=model_cfg["mlp"]["dropout"],
-                            batch_size=batch_size),                    
         "bilstm":   lambda: build_bilstm_model(input_shape,
                                                horizon=model_cfg["bilstm"]["horizon"],
                                                units=model_cfg["bilstm"]["units"],
@@ -425,133 +333,85 @@ def clone_local_from_global(global_models, input_shape, models_to_run, model_cfg
         local[k].set_weights(global_models[k].get_weights())
     return local
 
-def run_federated_training(X_train, y_train, X_val, y_val, X_test, y_test,
-                           models_to_run, rounds, fed_rounds, train_cfg, model_cfg,
-                           collect_per_hour: bool, y_test_hour_dict: dict,
-                           plot_cfg: dict | None = None):  # === ADDED
-    plot_cfg = plot_cfg or {}                                # === ADDED
-    want_val_plots = bool(plot_cfg.get("plot_validation_loss", False))   # === ADDED
-    want_fed_plots = bool(plot_cfg.get("plot_federated_rounds", False))  # === ADDED
+def federated_round(global_models, models_to_run, user_ids, data_dicts, train_cfg, model_cfg,
+                    collect_per_hour: bool, y_test_hour_dict: dict):
+    X_train, y_train, X_val, y_val, X_test, y_test = data_dicts
+    per_user_results, per_hour_rows = [], []
+    collected_weights = {k: [] for k in global_models.keys()}
 
-    user_ids = list(X_train.keys())
-    input_shape = X_train[user_ids[0]].shape
+    for uid in user_ids:
+        input_shape = X_train[uid].shape
+        local_models = clone_local_from_global(global_models, input_shape, models_to_run, model_cfg, train_cfg["batch_size"])
 
-    nice_names = {"mlp": "MLP", "bilstm": "BiLSTM", "softdense": "SoftDenseMoE", "softlstm": "SoftLSTMMoE"}
-    agg_mode = train_cfg.get("federated_aggregation", "sum")
-    assert agg_mode in ("sum", "weighted_sum"), "federated_aggregation must be 'sum' or 'weighted_sum'"
+        for key, mdl in local_models.items():
+            res = compile_fit_eval(
+                mdl,
+                X_train[uid], y_train[uid],
+                X_val[uid],   y_val[uid],
+                X_test[uid],  y_test[uid],
+                max_epochs=train_cfg["max_epochs"],
+                batch_size=train_cfg["batch_size"],
+                patience=train_cfg["patience"],
+                lr=train_cfg.get("learning_rate", 1e-3),
+            )
+            collected_weights[key].append(mdl.get_weights())
+            nice = {"bilstm":"BiLSTM", "softdense":"SoftDenseMoE", "softlstm":"SoftLSTMMoE"}[key]
+            row = {"user": uid, "architecture": nice, **res}
+            per_user_results.append(row)
 
-    all_rows, all_per_hour = [], []
-
-    # === ADDED: accumulators for plots
-    val_loss_curves = {k: [] for k in models_to_run}      # list of lists (per local fit)
-    fed_round_curves = {k: [] for k in models_to_run}     # avg global val MSE per fed_round
-
-    for r in range(rounds):
-        global_models = init_global_models(input_shape, models_to_run, model_cfg, train_cfg["batch_size"])
-
-        for f in range(fed_rounds):
-            collected_weights = {k: [] for k in global_models.keys()}
-            collected_val_losses = {k: [] for k in global_models.keys()}  # for weighted_sum
-
-            for uid in user_ids:
-                local_models = clone_local_from_global(global_models, input_shape, models_to_run, model_cfg, train_cfg["batch_size"])
-
-                for key, mdl in local_models.items():
-                    # local training
-                    hist = fit_local_only(mdl, X_train[uid], y_train[uid], X_val[uid], y_val[uid], train_cfg)
-                    # === ADDED: store val curves for plotting
-                    if want_val_plots and "val_loss" in hist:
-                        val_loss_curves[key].append(hist["val_loss"])
-
-                    # collect weights
-                    collected_weights[key].append(mdl.get_weights())
-
-                    # STRICT validation check
-                    loss_val, _, _ = mdl.evaluate(X_val[uid], y_val[uid],
-                                                  batch_size=train_cfg["batch_size"], verbose=0)
-                    if not np.isfinite(loss_val):
-                        raise ValueError(
-                            f"Non-finite validation loss detected "
-                            f"(user={uid}, arch={key}, round={r}, fed_round={f}). "
-                            f"Please inspect data/preprocessing/model config."
-                        )
-                    collected_val_losses[key].append(float(loss_val))
-
-            # Aggregate into global
-            for key in global_models.keys():
-                if agg_mode == "sum":
-                    avg_w = sum_weights(collected_weights[key])
-                else:
-                    losses = np.asarray(collected_val_losses[key], dtype=np.float64)
-                    scores = 1.0 / (losses + 1e-12)
-                    coeffs = scores / scores.sum()
-                    avg_w = weighted_average_weights(collected_weights[key], coeffs)
-                global_models[key].set_weights(avg_w)
-
-            # === ADDED: evaluate global model after aggregation for fed-round plot
-            if want_fed_plots:
-                for key, gmdl in global_models.items():
-                    # average validation MSE across users with the GLOBAL weights
-                    mses = []
-                    gmdl.compile(
-                        loss=tf.keras.losses.MeanSquaredError(),
-                        optimizer=tf.keras.optimizers.Adam(learning_rate=train_cfg.get("learning_rate", 1e-3)),
-                        metrics=[tf.keras.metrics.RootMeanSquaredError(), tf.keras.metrics.MeanAbsoluteError()]
-                    )
-                    for uid in user_ids:
-                        loss, _, _ = gmdl.evaluate(X_val[uid], y_val[uid],
-                                                   batch_size=train_cfg["batch_size"], verbose=0)
-                        mses.append(float(loss))
-                    fed_round_curves[key].append(float(np.mean(mses)))
-
-        # --- After final aggregation: local retrain or direct eval
-        do_local_retrain = bool(train_cfg.get("local_retraining", False))
-
-        for uid in user_ids:
-            local_models_final = clone_local_from_global(global_models, input_shape, models_to_run, model_cfg, train_cfg["batch_size"])
-
-            for key, mdl in local_models_final.items():
-                if do_local_retrain:
-                    res = compile_fit_eval(
-                        mdl,
-                        X_train[uid], y_train[uid],
-                        X_val[uid],   y_val[uid],
-                        X_test[uid],  y_test[uid],
-                        max_epochs=train_cfg["max_epochs"],
-                        batch_size=train_cfg["batch_size"],
-                        patience=train_cfg["patience"],
-                        lr=train_cfg.get("learning_rate", 1e-3),
-                    )
-                else:
-                    res = evaluate_only(
-                        mdl, X_test[uid], y_test[uid],
-                        batch_size=train_cfg["batch_size"],
-                        lr=train_cfg.get("learning_rate", 1e-3)
-                    )
-
-                row = {"user": uid, "architecture": nice_names[key], **res, "round": r, "fed_round": fed_rounds-1}
-                all_rows.append(row)
-
-                if collect_per_hour:
-                    yhat = mdl.predict(X_test[uid], batch_size=train_cfg["batch_size"], verbose=0).squeeze()
-                    ph = per_hour_metrics(y_true=y_test[uid].squeeze(), y_pred=yhat, hours=y_test_hour_dict[uid])
-                    ph["user"] = uid
-                    ph["architecture"] = nice_names[key]
-                    ph["round"] = r
-                    ph["fed_round"] = fed_rounds-1
-                    all_per_hour.append(ph)
+            if collect_per_hour:
+                yhat = mdl.predict(X_test[uid], batch_size=train_cfg["batch_size"], verbose=0).squeeze()
+                ph = per_hour_metrics(y_true=y_test[uid].squeeze(), y_pred=yhat, hours=y_test_hour_dict[uid])
+                ph["user"] = uid
+                ph["architecture"] = nice
+                per_hour_rows.append(ph)
 
         K.clear_session()
 
+    for key in global_models.keys():
+        avg_w = sum_weights(collected_weights[key])
+        global_models[key].set_weights(avg_w)
+
+    per_hour_df = pd.concat(per_hour_rows, ignore_index=True) if per_hour_rows else pd.DataFrame()
+    return per_user_results, per_hour_df
+
+def run_federated_training(X_train, y_train, X_val, y_val, X_test, y_test,
+                           models_to_run, rounds, fed_rounds, train_cfg, model_cfg,
+                           collect_per_hour: bool, y_test_hour_dict: dict):
+    user_ids = list(X_train.keys())
+    input_shape = X_train[user_ids[0]].shape
+    all_rows = []
+    all_per_hour = []
+
+    for r in range(rounds):
+        global_models = init_global_models(input_shape, models_to_run, model_cfg, train_cfg["batch_size"])
+        for f in range(fed_rounds):
+            per_user, ph = federated_round(
+                global_models,
+                models_to_run,
+                user_ids,
+                (X_train, y_train, X_val, y_val, X_test, y_test),
+                train_cfg,
+                model_cfg,
+                collect_per_hour=collect_per_hour,
+                y_test_hour_dict=y_test_hour_dict
+            )
+            for row in per_user:
+                row["round"] = r
+                row["fed_round"] = f
+            all_rows.extend(per_user)
+
+            if collect_per_hour and not ph.empty:
+                ph = ph.copy()
+                ph["round"] = r
+                ph["fed_round"] = f
+                all_per_hour.append(ph)
+
+            #print(f"FedAvg done: round {r}, fed_round {f}")
+
     res_df = pd.DataFrame(all_rows)
     ph_df = pd.concat(all_per_hour, ignore_index=True) if all_per_hour else pd.DataFrame()
-
-    # === ADDED: return plotting bundle
-    plot_bundle = {
-        "val_loss_curves": val_loss_curves,     # dict arch -> list[list]
-        "fed_round_curves": fed_round_curves,   # dict arch -> list[float]
-    }
-    return res_df, ph_df, plot_bundle  # === CHANGED
+    return res_df, ph_df
 
 # ============================================================
 # Clustering & noise attacks
@@ -563,19 +423,14 @@ def make_random_clusters(nr_buildings: int, cluster_size: int, seed: int = 42):
     return [list(arr[i:i+cluster_size]) for i in range(0, len(arr), cluster_size)]
 
 def uniform_poison_user(X_train, user_key: str, scale: float = 0.2):
-    # === CHANGED: perturb MAIN CHANNEL ONLY and DO NOT CLIP (stronger effect)
-    X = X_train[user_key]
-    noise = np.random.uniform(low=-scale, high=scale, size=X[:, :, 0:1].shape).astype(np.float32)
-    X_new = X.copy()
-    X_new[:, :, 0:1] = X[:, :, 0:1] + noise  # no clipping
-    X_train[user_key] = X_new
+    X_train[user_key] = X_train[user_key] + np.random.uniform(
+        low=-scale, high=scale, size=X_train[user_key].shape
+    )
 
 def gaussian_poison_user(X_train, user_key: str, scale: float = 0.2):
-    X = X_train[user_key]
-    noise = np.random.normal(loc=0.0, scale=scale, size=X[:, :, 0:1].shape).astype(np.float32)
-    X_new = X.copy()
-    X_new[:, :, 0:1] = X[:, :, 0:1] + noise  # no clipping
-    X_train[user_key] = X_new
+    X_train[user_key] = X_train[user_key] + np.random.normal(
+        loc=0.0, scale=scale, size=X_train[user_key].shape
+    )
 
 # ============================================================
 # GAN-style perturbation generator: training & application
@@ -612,136 +467,58 @@ def build_time_mask_for_sequences(X, start_h, start_m, num_steps, step_minutes, 
 def train_perturbation_generator(X, y, mask, input_shape, gan_cfg, surrogate_cfg):
     """
     Train generator G to maximize surrogate MSE on (X + delta(masked)), with L2 regularization.
-    Returns:
-      - delta: perturbations (N,T,F) for main channel only (others zeroed)
-      - logs:  dict with 'surrogate_loss','surrogate_val_loss','generator_loss' (lists)  # === ADDED
+    Returns the full perturbation tensor for X (same shape), to be applied on the main channel only.
     """
-    # 1) Train surrogate on clean data (kept, but fast)
+    # 1) Train surrogate on clean data
     surrogate = build_surrogate(input_shape, surrogate_cfg)
     surrogate.compile(loss="mse", optimizer=tf.keras.optimizers.Adam(surrogate_cfg.get("lr",1e-3)))
-    es = callbacks.EarlyStopping(monitor='val_loss', patience=surrogate_cfg.get("patience",3), restore_best_weights=True)
-    s_hist = surrogate.fit(
-        X, y,
-        epochs=surrogate_cfg.get("epochs", 5),           # keep small; 5–10 is usually enough
-        batch_size=gan_cfg.get("batch_size", 64),
-        validation_split=0.1,
-        verbose=0,
-        callbacks=[es]
-    )
+    es = callbacks.EarlyStopping(monitor='loss', patience=surrogate_cfg.get("patience",3), restore_best_weights=True)
+    surrogate.fit(X, y, epochs=surrogate_cfg.get("epochs",5), batch_size=gan_cfg.get("batch_size",64), verbose=0, callbacks=[es])
 
     # 2) Build generator
     G = build_perturbation_generator(input_shape)
-    opt = tf.keras.optimizers.Adam(learning_rate=gan_cfg.get("gen_lr", 1e-3))
+    opt = tf.keras.optimizers.Adam(learning_rate=gan_cfg.get("gen_lr",1e-3))
     epsilon = float(gan_cfg.get("epsilon", 0.2))
     lam = float(gan_cfg.get("lambda_reg", 1e-3))
     bs = int(gan_cfg.get("batch_size", 64))
+    steps = int(gan_cfg.get("steps", 200))
 
-    n_batches = int(np.ceil(len(X) / bs))
-    steps = int(2 * n_batches)   # ~2 passes worth of updates, but as single-batch steps
-
-    # === CHANGED: make dataset infinite and draw ONE batch per step
-    ds = (
-        tf.data.Dataset
-        .from_tensor_slices((X, y, mask))
-        .shuffle(len(X))
-        .batch(bs)
-        .repeat()                     # infinite
-    )
-    ds_iter = iter(ds)
-
-    gen_losses = []
+    # Dataset with mask
+    ds = tf.data.Dataset.from_tensor_slices((X, y, mask)).shuffle(len(X)).batch(bs).repeat(1)
 
     for _ in range(steps):
-        Xb, yb, mb = next(ds_iter)
-        with tf.GradientTape() as tape:
+        for Xb, yb, mb in ds:
+            with tf.GradientTape() as tape:
+                delta_full = G(Xb, training=True)                   # (B,T,F)
+                delta_main = delta_full[:,:,0:1] * mb               # mask main channel
+                delta_main = epsilon * tf.tanh(delta_main)          # bounded amplitude
+                main_adv = tf.clip_by_value(Xb[:,:,0:1] + delta_main, 0.0, 1.0)
+                Xadv = tf.concat([main_adv, Xb[:,:,1:]], axis=-1)   # leave time features intact
 
-            delta_full = G(Xb, training=True)                 # (B,T,F) in [-1,1] via tanh
-            delta_main = epsilon * delta_full[:, :, 0:1] * mb # (B,T,1) masked to time
-            main_adv   = Xb[:, :, 0:1] + delta_main           # no clip
-            Xadv       = tf.concat([main_adv, Xb[:, :, 1:]], axis=-1)
+                yhat = surrogate(Xadv, training=False)
+                mse = tf.reduce_mean(tf.square(yb - yhat))
+                reg = tf.reduce_mean(tf.square(delta_main))
+                # maximize mse -> minimize negative mse + lambda*reg
+                loss = -mse + lam*reg
 
-            yhat = surrogate(Xadv, training=False)
-            mse  = tf.reduce_mean(tf.square(yb - yhat))
-            reg  = tf.reduce_mean(tf.square(delta_main))
-            loss = -mse + lam * reg
+            grads = tape.gradient(loss, G.trainable_variables)
+            opt.apply_gradients(zip(grads, G.trainable_variables))
 
-        grads = tape.gradient(loss, G.trainable_variables)
-        opt.apply_gradients(zip(grads, G.trainable_variables))
-        gen_losses.append(float(loss.numpy()))
-
-    # 3) Produce final perturbations
+    # 3) Produce final perturbations for full X
     delta_full = G.predict(X, batch_size=bs, verbose=0)
-    delta_main = epsilon * delta_full[:, :, 0:1] * mask
-    delta = np.concatenate([delta_main, np.zeros_like(delta_full[:, :, 1:])], axis=-1).astype(np.float32)
-
-    logs = {
-        "surrogate_loss":     list(s_hist.history.get("loss", [])),
-        "surrogate_val_loss": list(s_hist.history.get("val_loss", [])),
-        "generator_loss":     gen_losses,
-    }
-    return delta, logs
+    delta_main = epsilon * np.tanh(delta_full[:,:,0:1])
+    # apply mask (1 for poison, sparse for backdoor)
+    delta_main = delta_main * mask
+    # build full-chan perturbation (only main channel perturbed)
+    delta = np.concatenate([delta_main, np.zeros_like(delta_full[:,:,1:])], axis=-1).astype(np.float32)
+    return delta
 
 def apply_delta_to_dataset(X, delta):
-    """Apply delta to X (perturb only main channel)."""
-    # === CHANGED: NO CLIP to [0,1]; keep values as-is for stronger noise effect
+    """Apply delta to X (perturb only main channel and clip to [0,1])."""
     X_new = X.copy()
-    X_new[:, :, 0:1] = X_new[:, :, 0:1] + delta[:, :, 0:1]
+    adv_main = np.clip(X_new[:,:,0:1] + delta[:,:,0:1], 0.0, 1.0)
+    X_new[:,:,0:1] = adv_main
     return X_new
-
-# ============================================================
-# Plotting
-# ============================================================
-def plot_validation_curves(curves_by_arch, outdir, title_prefix="val_loss"):
-    for arch, curves in curves_by_arch.items():
-        if not curves:
-            continue
-        fig, ax = plt.subplots(figsize=(20,5))
-        # plot each local curve faint
-        max_len = max(len(c) for c in curves)
-        mat = np.full((len(curves), max_len), np.nan)
-        for i, c in enumerate(curves):
-            mat[i, :len(c)] = c
-            ax.plot(range(1, len(c)+1), c, alpha=0.25)
-        # median across local runs
-        med = np.nanmedian(mat, axis=0)
-        ax.plot(range(1, max_len+1), med, linewidth=2, label='median')
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Validation loss (MSE)")
-        ax.set_title(f"{title_prefix} – {arch}")
-        ax.legend(loc="best")
-        plt.show()
-
-def plot_fedround_curves(fed_curves_by_arch, outdir, title="fed_round_mse"):
-    for arch, seq in fed_curves_by_arch.items():
-        if not seq:
-            continue
-        fig, ax = plt.subplots(figsize=(20,5))
-        ax.plot(range(1, len(seq)+1), seq, marker='o')
-        ax.set_xlabel("Federated round")
-        ax.set_ylabel("Avg val MSE (global)")
-        ax.set_title(f"Global val MSE vs. Fed round – {arch}")
-        plt.show()
-
-def plot_noise_first_week(X_before, X_after, step_minutes, outdir, title="noise_first_week"):
-    """
-    X_before / X_after: (N, T, F) sequences. We'll take the label step (last step) of each window
-    to reconstruct a proxy of the underlying series. This is consistent with your target y.
-    """
-    steps_week = int(round(7*24*60 / step_minutes))
-    n = min(len(X_before), len(X_after), steps_week)
-    if n <= 0:
-        return
-    s_before = X_before[:n, -1, 0].astype(float)  # main channel at label step
-    s_after  = X_after[:n,  -1, 0].astype(float)
-
-    fig, ax = plt.subplots(figsize=(20,5))
-    ax.plot(np.arange(n), s_before, label="clean (proxy)")
-    ax.plot(np.arange(n), s_after,  label="noised (proxy)", alpha=0.8)
-    ax.set_xlabel(f"Steps (Δ={step_minutes} min)")
-    ax.set_ylabel("Scaled main channel")
-    ax.set_title("First week: clean vs. noised (label steps)")
-    ax.legend(loc="best")
-    plt.show()
 
 # ============================================================
 # MAIN
@@ -751,18 +528,8 @@ def main(cfg: dict):
 
     # Paths / output
     results_dir = cfg.get("output", {}).get("results_dir", "results2")
-    ensure_dir(results_dir)
+    ensure_dir(results_dir) # Make sure directory exists
     exp_name = cfg.get("output", {}).get("experiment_name", "FL_Exp")
-
-    # Plotting config
-    plot_cfg = cfg.get("plots", {
-        "plot_validation_loss": False,
-        "plot_federated_rounds": False,
-        "plot_noise": False
-    })
-    plot_val   = bool(plot_cfg.get("plot_validation_loss", False))
-    plot_fed   = bool(plot_cfg.get("plot_federated_rounds", False))
-    plot_noise = bool(plot_cfg.get("plot_noise", False))
 
     # Data params
     file_path = cfg.get("data", {}).get("file_path", "../../data/3final_data/Final_Energy_dataset.csv")
@@ -779,9 +546,6 @@ def main(cfg: dict):
         "batch_size": int(cfg.get("train", {}).get("batch_size", 16)),
         "patience": int(cfg.get("train", {}).get("patience", 10)),
         "learning_rate": float(cfg.get("train", {}).get("learning_rate", 1e-3)),
-        "local_retraining": bool(cfg.get("train", {}).get("local_retraining", False)),
-        "federated_aggregation": str(cfg.get("train", {}).get("federated_aggregation", "sum")).lower(),
-        "plots": plot_cfg
     }
     rounds = int(cfg.get("train", {}).get("rounds", 3))
     fed_rounds = int(cfg.get("train", {}).get("fed_rounds", 3))
@@ -790,7 +554,7 @@ def main(cfg: dict):
     attack_cfg = cfg.get("attack", {"enabled": False})
     gan_cfg = cfg.get("gan", {})
 
-    # Make clusters and save mapping
+    # Make clusters and save mapping (keep for reproducibility)
     clusters = make_random_clusters(nr_buildings, cluster_size, seed=cfg.get("seed", 42))
     clusters_df = pd.DataFrame({
         "cluster_index": np.concatenate([[i+1]*len(c) for i,c in enumerate(clusters)]),
@@ -798,28 +562,23 @@ def main(cfg: dict):
     })
     clusters_csv = os.path.join(results_dir, f"{exp_name}_clusters.csv")
     clusters_df.to_csv(clusters_csv, index=False)
+    #print(f"Saved cluster assignment -> {clusters_csv}")
 
+    # Collect only detailed results (all clusters pooled) and per-hour (optional)
     all_clusters_all_results = []
     per_cluster_ph = []
 
-    # Accumulators for GAN plots (per cluster)
-    gan_surrogate_curves = []
-    gan_generator_curves = []
-
     for ci, buildings in enumerate(clusters, start=1):
-        cluster_outdir = os.path.join(results_dir, f"{exp_name}_C{ci:02d}")
-
+        # Load & split per cluster
         df_array = load_and_prepare_data(file_path, buildings, columns_filter_prefix=columns_filter_prefix)
         step_minutes = infer_step_minutes_from_index(df_array[0].index)
         X_train, y_train, X_val, y_val, X_test, y_test, y_test_hour = split_data(
             df_array, sequence_length=sequence_length, batch_size=train_cfg["batch_size"]
         )
         
+        # --- Attack on FIRST building (user1)
         poisoned_building = buildings[0]
         attack_type, attack_details = "none", "none"
-
-        # Keep a clean copy for plotting (train only)
-        X_user1_before = None
 
         if attack_cfg.get("enabled", False):
             a_type = attack_cfg.get("type","poison").lower()
@@ -829,33 +588,21 @@ def main(cfg: dict):
                 if mode == "noise":
                     dist = attack_cfg["poison"].get("distribution","uniform").lower()
                     scale = float(attack_cfg["poison"].get("scale",0.2))
-                    if plot_noise:
-                        X_user1_before = X_train["user1"].copy()
-                    if dist == "uniform":
-                        uniform_poison_user(X_train, "user1", scale)
-                    elif dist == "gaussian":
-                        gaussian_poison_user(X_train, "user1", scale)
-                    else:
-                        raise ValueError("poison.distribution must be uniform|gaussian")
+                    if dist == "uniform":  uniform_poison_user(X_train, "user1", scale)
+                    elif dist == "gaussian": gaussian_poison_user(X_train, "user1", scale)
+                    else: raise ValueError("poison.distribution must be uniform|gaussian")
                     attack_type = "poison"
                     attack_details = f"mode=noise, distribution={dist}, scale={scale}"
 
                 elif mode == "gan":
                     X = X_train["user1"]; y = y_train["user1"]
-                    if plot_noise:
-                        X_user1_before = X.copy()
                     mask = np.ones((X.shape[0], X.shape[1], 1), dtype=np.float32)
-                    delta, gan_logs = train_perturbation_generator(
+                    delta = train_perturbation_generator(
                         X, y, mask, input_shape=X.shape, gan_cfg=gan_cfg, surrogate_cfg=gan_cfg.get("surrogate",{})
                     )
                     X_train["user1"] = apply_delta_to_dataset(X, delta)
-                    gan_surrogate_curves.append((
-                        gan_logs.get("surrogate_loss", []),
-                        gan_logs.get("surrogate_val_loss", [])
-                    ))
-                    gan_generator_curves.append(gan_logs.get("generator_loss", []))
                     attack_type = "poison"
-                    attack_details = f"mode=gan, epsilon={gan_cfg.get('epsilon')}, lambda_reg={gan_cfg.get('lambda_reg')}"
+                    attack_details = f"mode=gan, epsilon={gan_cfg.get('epsilon')}, lambda_reg={gan_cfg.get('lambda_reg')}, steps={gan_cfg.get('steps')}"
                 else:
                     raise ValueError("attack.mode must be noise|gan")
 
@@ -863,40 +610,40 @@ def main(cfg: dict):
                 bd = attack_cfg.get("backdoor", {})
                 start_h, start_m = hhmm_to_hour_min(bd.get("start_time","10:30"))
                 num_steps = int(bd.get("num_steps",4))
+                activate_in_test = bool(bd.get("activate_in_test", True))
 
                 if mode == "noise":
                     noise_scale = float(bd.get("noise_scale",0.2))
                     X = X_train["user1"]
-                    if plot_noise:
-                        X_user1_before = X.copy()
                     mask = build_time_mask_for_sequences(X, start_h, start_m, num_steps, step_minutes)
                     noise = np.random.normal(0.0, noise_scale, size=X[:,:,0:1].shape)
                     delta = np.concatenate([noise*mask, np.zeros((X.shape[0],X.shape[1],X.shape[2]-1))], axis=-1)
                     X_train["user1"] = apply_delta_to_dataset(X, delta)
-
-                    # === CHANGED: NO test-time activation, NO touching X_test, NO generator on test
+                    if activate_in_test:
+                        Xt = X_test["user1"]
+                        mask_t = build_time_mask_for_sequences(Xt, start_h, start_m, num_steps, step_minutes)
+                        noise_t = np.random.normal(0.0, noise_scale, size=Xt[:,:,0:1].shape)
+                        delta_t = np.concatenate([noise_t*mask_t, np.zeros((Xt.shape[0],Xt.shape[1],Xt.shape[2]-1))], axis=-1)
+                        X_test["user1"] = apply_delta_to_dataset(Xt, delta_t)
                     attack_type = "backdoor"
-                    attack_details = f"mode=noise, start={bd.get('start_time')}, steps={num_steps}, noise_scale={bd.get('noise_scale')}"
+                    attack_details = f"mode=noise, start={bd.get('start_time')}, steps={num_steps}, noise_scale={bd.get('noise_scale')}, activate_in_test={activate_in_test}"
 
                 elif mode == "gan":
                     X = X_train["user1"]; y = y_train["user1"]
-                    if plot_noise:
-                        X_user1_before = X.copy()
                     mask = build_time_mask_for_sequences(X, start_h, start_m, num_steps, step_minutes)
-                    delta, gan_logs = train_perturbation_generator(
+                    delta = train_perturbation_generator(
                         X, y, mask, input_shape=X.shape, gan_cfg=gan_cfg, surrogate_cfg=gan_cfg.get("surrogate",{})
                     )
                     X_train["user1"] = apply_delta_to_dataset(X, delta)
-
-                    # === CHANGED: NO test-time activation, NO re-training generator on test
-                    gan_surrogate_curves.append((
-                        gan_logs.get("surrogate_loss", []),
-                        gan_logs.get("surrogate_val_loss", [])
-                    ))
-                    gan_generator_curves.append(gan_logs.get("generator_loss", []))
-
+                    if activate_in_test:
+                        Xt = X_test["user1"]
+                        mask_t = build_time_mask_for_sequences(Xt, start_h, start_m, num_steps, step_minutes)
+                        delta_t = train_perturbation_generator(
+                            Xt, y_test["user1"], mask_t, input_shape=Xt.shape, gan_cfg=gan_cfg, surrogate_cfg=gan_cfg.get("surrogate",{})
+                        )
+                        X_test["user1"] = apply_delta_to_dataset(Xt, delta_t)
                     attack_type = "backdoor"
-                    attack_details = f"mode=gan, start={bd.get('start_time')}, steps={num_steps}, epsilon={gan_cfg.get('epsilon')}, lambda_reg={gan_cfg.get('lambda_reg')}"
+                    attack_details = f"mode=gan, start={bd.get('start_time')}, steps={num_steps}, epsilon={gan_cfg.get('epsilon')}, lambda_reg={gan_cfg.get('lambda_reg')}, activate_in_test={activate_in_test}"
                 else:
                     raise ValueError("attack.mode must be noise|gan")
             else:
@@ -905,35 +652,17 @@ def main(cfg: dict):
         attack_label = f"{attack_type}({attack_details})"
         print(f"[Cluster {ci}] buildings={buildings} | attack={attack_label}")
 
-        # Plot train-time noise vs clean (first week)
-        if plot_noise and X_user1_before is not None:
-            plot_noise_first_week(
-                X_before=X_user1_before,
-                X_after=X_train["user1"],
-                step_minutes=step_minutes,
-                outdir=cluster_outdir,
-                title=f"{exp_name}_C{ci:02d}_user1_firstweek"
-            )
-
         # Train FL for this cluster
         collect_per_hour = (attack_type == "backdoor")
-        cluster_results, cluster_per_hour, plot_bundle = run_federated_training(
+        cluster_results, cluster_per_hour = run_federated_training(
             X_train, y_train, X_val, y_val, X_test, y_test,
             models_to_run=models_to_run,
             rounds=rounds, fed_rounds=fed_rounds,
             train_cfg=train_cfg, model_cfg=model_cfg,
-            collect_per_hour=collect_per_hour, y_test_hour_dict=y_test_hour,
-            plot_cfg=plot_cfg
+            collect_per_hour=collect_per_hour, y_test_hour_dict=y_test_hour
         )
 
-        if plot_val:
-            plot_validation_curves(plot_bundle["val_loss_curves"], outdir=cluster_outdir,
-                                   title_prefix=f"{exp_name}_C{ci:02d}_val")
-        if plot_fed:
-            plot_fedround_curves(plot_bundle["fed_round_curves"], outdir=cluster_outdir,
-                                 title=f"{exp_name}_C{ci:02d}_fed")
-
-        # Metadata mapping
+        # Map 'user' -> building id and add metadata
         user_to_building = {f"user{k+1}": b for k,b in enumerate(buildings)}
         cluster_results = cluster_results.copy()
         cluster_results["building"] = cluster_results["user"].map(user_to_building)
@@ -953,6 +682,7 @@ def main(cfg: dict):
 
         all_clusters_all_results.append(cluster_results)
 
+        # keep per-hour only in memory; save once after all clusters
         if collect_per_hour and not cluster_per_hour.empty:
             cluster_per_hour = cluster_per_hour.copy()
             cluster_per_hour["cluster_index"] = ci
@@ -965,11 +695,13 @@ def main(cfg: dict):
             cluster_per_hour["experiment"] = exp_name
             per_cluster_ph.append(cluster_per_hour)
 
+    # --- Single detailed CSV across all clusters
     combined_all = pd.concat(all_clusters_all_results, ignore_index=True) if all_clusters_all_results else pd.DataFrame()
     combined_all_file = os.path.join(results_dir, f"{exp_name}_all_results.csv")
     combined_all.to_csv(combined_all_file, index=False)
     print(f"Saved -> {combined_all_file}")
 
+    # --- Optional per-hour CSV across all clusters (if backdoor produced it)
     all_ph = None
     if per_cluster_ph:
         all_ph = pd.concat(per_cluster_ph, ignore_index=True)
@@ -977,19 +709,7 @@ def main(cfg: dict):
         all_ph.to_csv(all_ph_file, index=False)
         print(f"Saved -> {all_ph_file}")
 
-    if plot_val and gan_surrogate_curves:
-        sloss = [ls for (ls, _) in gan_surrogate_curves if ls]
-        sval  = [lv for (_, lv) in gan_surrogate_curves if lv]
-        if sloss:
-            plot_validation_curves({"surrogate": sloss}, outdir=results_dir,
-                                   title_prefix=f"{exp_name}_GAN_surrogate_trainloss")
-        if sval:
-            plot_validation_curves({"surrogate": sval}, outdir=results_dir,
-                                   title_prefix=f"{exp_name}_GAN_surrogate_valloss")
-    if plot_val and gan_generator_curves:
-        plot_validation_curves({"generator": gan_generator_curves}, outdir=results_dir,
-                               title_prefix=f"{exp_name}_GAN_generator_loss")
-
+    # return only the detailed frames you keep
     return combined_all, all_ph
 
 def default_cfg():
@@ -999,12 +719,11 @@ def default_cfg():
         "file_path": "../../data/3final_data/Final_Energy_dataset.csv",  # fallback: "../../data/3final_data/Final_Energy_dataset.csv"
         "columns_filter_prefix": "load",  # choices: "load" | "pv" | "prosumption" ; fallback: "load"
         "sequence_length": 25,            # fallback: 25
-        "nr_buildings": 6,                # fallback: 30
+        "nr_buildings": 10,                # fallback: 30
         "cluster_size": 2                 # fallback: 2
     },
-    "models_to_run": ["mlp", "softdense"],  # choices: any subset of {"mlp","bilstm","softdense","softlstm"} ; fallback: ["bilstm","softdense","softlstm"]
+    "models_to_run": ["bilstm","softdense","softlstm"],  # choices: any subset of {"bilstm","softdense","softlstm"} ; fallback: ["bilstm","softdense","softlstm"]
     "model_hyperparams": {
-        "mlp":      { "horizon": 1, "dense_units": 32, "num_layers": 2, "dropout": 0.2 },
         "bilstm":   { "horizon": 1, "units": 8, "num_layers": 2, "dropout": 0.2 },
         "softdense":{"horizon": 1, "num_experts": 4, "expert_units": 8, "dense_units": 16, "dropout": 0.2 },
         "softlstm": { "horizon": 1, "num_experts": 4, "expert_units": 8, "lstm_units": 4, "dropout": 0.2 }
@@ -1013,11 +732,9 @@ def default_cfg():
         "max_epochs": 50,            # fallback: 100
         "batch_size": 256,          # fallback: 16
         "patience": 10,             # fallback: 10
-        "learning_rate": 1e-4,      # fallback: 1e-3
-        "rounds": 1,                # fallback: 3
-        "fed_rounds": 3,             # fallback: 3
-        "local_retraining": False,
-        "federated_aggregation": "sum" # ["sum", "weighted_sum"] 
+        "learning_rate": 1e-3,      # fallback: 1e-3
+        "rounds": 3,                # fallback: 3
+        "fed_rounds": 3             # fallback: 3
     },
     "attack": {
         "enabled": True,
@@ -1031,37 +748,34 @@ def default_cfg():
             "start_time": "10:30",
             "num_steps": 4,
             "noise_scale": 0.2,        # used only when mode="noise"
+            "activate_in_test": False
         }
     },
     "gan": {
         "epsilon": 0.2,          # max per-step magnitude after tanh squashing
         "lambda_reg": 1e-4,      # perturbation magnitude regularizer
-        "batch_size": 256,        # generator mini-batch
+        "steps": 50,            # generator steps (epochs over batches)
+        "batch_size": 64,        # generator mini-batch
         "gen_lr": 1e-3,
         "surrogate": {           # small forecaster used to guide the generator
-            "epochs": 50,
-            "units": 32,
-            "num_layers": 2,
+            "epochs": 30,
+            "units": 8,
+            "num_layers": 1,
             "dropout": 0.0,
             "lr": 1e-3,
             "patience": 3
         }
     },
     "output": {
-        "results_dir": "results3",
+        "results_dir": "results2",
         "experiment_name": "Tes"
-    },
-    "plots": {
-        "plot_validation_loss": False,
-        "plot_federated_rounds": False,
-        "plot_noise": False
-    },
+    }
 }
 
-def make_cfg(columns="load", nr_buildings=6, cluster_size=2, experiment_name="Test", results_dir="results3",
+def make_cfg(columns="load", nr_buildings=10, cluster_size=2, experiment_name="Test",
     attack_type="poison",   # "poison" or "backdoor"
     attack_mode="noise",    # "noise" or "gan"
-    scale=0.2, local_retraining=True, federated_aggregation="sum", plot=False
+    scale=0.2,              # sets poison.scale, backdoor.noise_scale, GAN epsilon
 ):
     cfg = default_cfg() 
 
@@ -1070,7 +784,6 @@ def make_cfg(columns="load", nr_buildings=6, cluster_size=2, experiment_name="Te
     cfg["data"]["cluster_size"] = int(cluster_size)
 
     cfg["output"]["experiment_name"] = experiment_name
-    cfg["output"]["results_dir"] = results_dir
 
     cfg["attack"]["type"] = attack_type
     cfg["attack"]["mode"] = attack_mode
@@ -1078,12 +791,5 @@ def make_cfg(columns="load", nr_buildings=6, cluster_size=2, experiment_name="Te
     cfg["attack"]["poison"]   = {"scale": float(scale)}
     cfg["attack"]["backdoor"] = {"noise_scale": float(scale)}
     cfg["gan"]["epsilon"] = float(scale)
-
-    cfg["train"]["local_retraining"] = bool(local_retraining)
-    cfg["train"]["federated_aggregation"] = str(federated_aggregation).lower()
-
-    cfg["plots"]["plot_validation_loss"]   = bool(plot)
-    cfg["plots"]["plot_federated_rounds"] = bool(plot)
-    cfg["plots"]["plot_noise"] = bool(plot)
 
     return cfg
