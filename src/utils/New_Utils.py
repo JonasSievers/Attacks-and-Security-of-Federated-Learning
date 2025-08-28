@@ -1061,7 +1061,7 @@ def default_cfg():
 def make_cfg(columns="load", nr_buildings=6, cluster_size=2, experiment_name="Test", results_dir="results3",
     attack_type="poison",   # "poison" or "backdoor"
     attack_mode="noise",    # "noise" or "gan"
-    scale=0.2, local_retraining=True, federated_aggregation="sum", plot=False
+    scale=0.2, local_retraining=True, fed_rounds=3, federated_aggregation="sum", plot=False
 ):
     cfg = default_cfg() 
 
@@ -1080,6 +1080,7 @@ def make_cfg(columns="load", nr_buildings=6, cluster_size=2, experiment_name="Te
     cfg["gan"]["epsilon"] = float(scale)
 
     cfg["train"]["local_retraining"] = bool(local_retraining)
+    cfg["train"]["fed_rounds"] = int(fed_rounds)
     cfg["train"]["federated_aggregation"] = str(federated_aggregation).lower()
 
     cfg["plots"]["plot_validation_loss"]   = bool(plot)
